@@ -1348,6 +1348,18 @@ export class IsobmffDemuxer extends Demuxer {
 						}
 
 						track.info.numberOfChannels = channelCount;
+
+						// Rates above 65535 Hz can't be stored in the 16.16 fixed-point field, so they're written
+						// repeatedly halved. The real rate is still available from the media header's timescale, so
+						// double the stored rate while it remains a divisor of it.
+						while (
+							track.timescale > 0
+							&& sampleRate > 0
+							&& sampleRate * 2 <= track.timescale
+							&& track.timescale % (sampleRate * 2) === 0
+						) {
+							sampleRate *= 2;
+						}
 						track.info.sampleRate = sampleRate;
 
 						track.frmaCodecString = null;

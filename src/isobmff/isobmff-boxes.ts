@@ -892,6 +892,19 @@ export const av1C = (trackData: IsobmffVideoTrackData) => {
 	return box('av1C', generateAv1CodecConfigurationFromCodecString(trackData.info.decoderConfig.codec));
 };
 
+/**
+ * The 16.16 fixed-point sample rate field of a version 1 sound sample description can't hold rates above 65535 Hz. For
+ * those (e.g. 88.2/96/192 kHz) the field instead stores the rate repeatedly halved until it fits, while the real rate
+ * is still preserved in the media header's timescale. Rates at or below 48 kHz are stored unchanged.
+ */
+const getSoundSampleDescriptionRate = (sampleRate: number) => {
+	let rate = sampleRate;
+	while (rate > 48_000) {
+		rate /= 2;
+	}
+	return rate;
+};
+
 /** Sound Sample Description Box: Contains information that defines how to interpret sound media data. */
 export const soundSampleDescription = (
 	compressionType: string,
@@ -917,6 +930,8 @@ export const soundSampleDescription = (
 		version = 1;
 	}
 
+	const sampleRate = getSoundSampleDescriptionRate(trackData.info.sampleRate);
+
 	if (version === 0) {
 		contents = [
 			Array(6).fill(0), // Reserved
@@ -931,7 +946,7 @@ export const soundSampleDescription = (
 			trackData.track.source._codec === 'truehd'
 				? u32(trackData.info.sampleRate) // TrueHD stores the sample rate as a plain integer
 				: [
-						u16(trackData.info.sampleRate < 2 ** 16 ? trackData.info.sampleRate : 0), // Sample rate (upper)
+						u16(sampleRate < 2 ** 16 ? sampleRate : 0), // Sample rate (upper)
 						u16(0), // Sample rate (lower)
 					],
 		];
@@ -945,10 +960,10 @@ export const soundSampleDescription = (
 			u16(0), // Revision level
 			u32(0), // Vendor
 			u16(trackData.info.numberOfChannels), // Number of channels
-			u16(Math.min(sampleSizeInBits, 16)), // Sample size (bits)
+			u16(sampleSizeInBits), // Sample size (bits)
 			i16(compressionId), // Compression ID
 			u16(0), // Packet size
-			u16(trackData.info.sampleRate < 2 ** 16 ? trackData.info.sampleRate : 0), // Sample rate (upper)
+			u16(sampleRate), // Sample rate (upper)
 			u16(0), // Sample rate (lower)
 			isPcmCodec
 				? [

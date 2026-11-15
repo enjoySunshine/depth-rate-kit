@@ -750,3 +750,197 @@ test('Fragmented MP4 preserves interior key packets', async () => {
 	expect((await sink.getNextKeyPacket(first, { metadataOnly: true }))?.timestamp).toBe(2);
 	expect((await sink.getKeyPacket(4.1, { metadataOnly: true }))?.timestamp).toBe(4);
 });
+
+// Walks the nested ISO BMFF boxes and returns the content (payload without header) of the first box with the name
+const findBoxContent = (data: Uint8Array | ArrayBuffer, targetName: string): Uint8Array | null => {
+	const root = data instanceof Uint8Array ? data : new Uint8Array(data);
+
+	const search = (buffer: Uint8Array): Uint8Array | null => {
+		let offset = 0;
+		while (offset + 8 <= buffer.byteLength) {
+			const view = new DataView(buffer.buffer, buffer.byteOffset + offset, buffer.byteLength - offset);
+			let size = view.getUint32(0);
+			const name = new TextDecoder().decode(buffer.subarray(offset + 4, offset + 8));
+			const headerSize = size === 1 ? 16 : 8;
+			if (size === 1) {
+				size = Number(view.getBigUint64(8));
+			}
+			if (size < headerSize || offset + size > buffer.byteLength) {
+				break;
+			}
+
+			const content = buffer.subarray(offset + headerSize, offset + size);
+			if (name === targetName) {
+				return content;
+			}
+			const nested = search(content);
+			if (nested) {
+				return nested;
+			}
+			offset += size;
+		}
+		return null;
+	};
+	return search(root);
+};
+
+// Reads the legacy and version-1 fields of an audio sound sample description
+const readSoundSampleDescription = (content: Uint8Array) => {
+	const view = new DataView(content.buffer, content.byteOffset, content.byteLength);
+	let offset = 6 + 2; // Reserved + data reference index
+	const version = view.getUint16(offset);
+	offset += 2 + 2 + 4; // Version + revision level + vendor
+	const numberOfChannels = view.getUint16(offset);
+	offset += 2;
+	const sampleSizeInBits = view.getUint16(offset);
+	offset += 2 + 2 + 2; // Compression ID + packet size
+	const sampleRate = view.getUint32(offset) / 0x10000;
+	offset += 4;
+
+	let version1SampleSizeInBits: number | undefined;
+	if (version === 1) {
+		offset += 4; // Samples per packet
+		version1SampleSizeInBits = 8 * view.getUint32(offset);
+	}
+	return { version, numberOfChannels, sampleSizeInBits, version1SampleSizeInBits, sampleRate };
+};
+
+const PCM_SOUND_SAMPLE_DESCRIPTIONS = [
+	{ codec: 'pcm-s24', sampleRate: 96000, expectedFieldRate: 48000 },
+	{ codec: 'pcm-s24', sampleRate: 192000, expectedFieldRate: 48000 },
+	{ codec: 'pcm-s24', sampleRate: 88200, expectedFieldRate: 44100 },
+	{ codec: 'pcm-s24', sampleRate: 44100, expectedFieldRate: 44100 },
+	{ codec: 'pcm-s16', sampleRate: 48000, expectedFieldRate: 48000 },
+] as const;
+
+for (const { codec, sampleRate, expectedFieldRate } of PCM_SOUND_SAMPLE_DESCRIPTIONS) {
+	const expectedBitDepth = codec === 'pcm-s24' ? 24 : 16;
+	const bytesPerSample = expectedBitDepth / 8;
+	// Frame-aligned payload (a whole number of stereo frames) so the packet round-trips through the demuxer
+	const packetData = new Uint8Array(17 * bytesPerSample * 2).fill(77);
+	const duration = packetData.byteLength / bytesPerSample / 2 / sampleRate;
+
+	test(`PCM sound sample description stores ${expectedBitDepth}-bit ${sampleRate} Hz correctly`, async () => {
+		const target = new BufferTarget();
+		const output = new Output({ format: new Mp4OutputFormat(), target });
+		const source = new EncodedAudioPacketSource(codec);
+		output.addAudioTrack(source);
+
+		await output.start();
+		await source.add(
+			new EncodedPacket(packetData, 'key', 0, duration),
+			{ decoderConfig: { codec, numberOfChannels: 2, sampleRate } },
+		);
+		await output.finalize();
+
+		// The written sample description must advertise the real bit depth and a sample rate that fits the field
+		const stsdContent = findBoxContent(target.buffer!, 'stsd');
+		assert(stsdContent);
+		// Skip stsd version/flags (4) + entry count (4) + the sample entry's box header (8)
+		const sampleEntryContent = stsdContent.subarray(4 + 4 + 8);
+		const description = readSoundSampleDescription(sampleEntryContent);
+
+		expect(description.version).toBe(expectedBitDepth > 16 ? 1 : 0);
+		expect(description.numberOfChannels).toBe(2);
+		expect(description.sampleSizeInBits).toBe(expectedBitDepth);
+		if (description.version === 1) {
+			expect(description.version1SampleSizeInBits).toBe(expectedBitDepth);
+		}
+		expect(description.sampleRate).toBe(expectedFieldRate);
+
+		// Reading the file back must still report the real sample rate, and the packet must pass through unchanged
+		using input = new Input({ source: new BufferSource(target.buffer!), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		expect(await track.getSampleRate()).toBe(sampleRate);
+		expect(await track.getNumberOfChannels()).toBe(2);
+		expect(await track.getCodec()).toBe(codec);
+
+		const sink = new EncodedPacketSink(track);
+		const packet = (await sink.getFirstPacket())!;
+		expect(packet.byteLength).toBe(packetData.byteLength);
+		expect(packet.data[0]).toBe(77);
+		expect(packet.timestamp).toBe(0);
+		expect(packet.duration).toBeCloseTo(duration);
+	});
+}
+
+// Minimal ISO BMFF box builders used to craft third-party-style files by hand
+const concatBytes = (...parts: (Uint8Array | number[])[]) => {
+	const arrays = parts.map(part => part instanceof Uint8Array ? part : Uint8Array.from(part));
+	const total = arrays.reduce((sum, array) => sum + array.byteLength, 0);
+	const out = new Uint8Array(total);
+	let offset = 0;
+	for (const array of arrays) {
+		out.set(array, offset);
+		offset += array.byteLength;
+	}
+	return out;
+};
+const asciiBytes = (text: string) => Uint8Array.from(text, char => char.charCodeAt(0));
+const u32be = (value: number) => Uint8Array.of(
+	(value >>> 24) & 255,
+	(value >>> 16) & 255,
+	(value >>> 8) & 255,
+	value & 255,
+);
+const u16be = (value: number) => Uint8Array.of((value >>> 8) & 255, value & 255);
+const rawBox = (name: string, ...parts: Uint8Array[]) => {
+	const content = concatBytes(...parts);
+	return concatBytes(u32be(8 + content.byteLength), asciiBytes(name), content);
+};
+const fullRawBox = (name: string, ...parts: Uint8Array[]) =>
+	rawBox(name, Uint8Array.of(0, 0, 0, 0), ...parts);
+
+// A version-0 'sowt' (16-bit PCM) sound sample entry whose 16.16 sample rate field is deliberately capped, paired with
+// a media header timescale carrying the real rate, as third-party muxers write for rates above 65535 Hz
+const cappedRateAudioFile = (storedRate: number, timescale: number) => {
+	const sampleEntry = rawBox(
+		'sowt',
+		new Uint8Array(6), // Reserved
+		u16be(1), // Data reference index
+		u16be(0), // Version
+		u16be(0), // Revision level
+		u32be(0), // Vendor
+		u16be(2), // Number of channels
+		u16be(16), // Sample size (bits)
+		u16be(0), // Compression ID
+		u16be(0), // Packet size
+		u32be(storedRate * 0x10000), // Sample rate (16.16 fixed point)
+	);
+	const mdhd = fullRawBox('mdhd', u32be(0), u32be(0), u32be(timescale), u32be(0), u16be(0), u16be(0));
+	const hdlr = fullRawBox('hdlr', u32be(0), asciiBytes('soun'), new Uint8Array(12), Uint8Array.of(0));
+	const stbl = rawBox(
+		'stbl',
+		fullRawBox('stsd', u32be(1), sampleEntry),
+		fullRawBox('stts', u32be(0)),
+		fullRawBox('stsc', u32be(0)),
+		fullRawBox('stsz', u32be(0), u32be(0)),
+		fullRawBox('stco', u32be(0)),
+	);
+	const mdia = rawBox('mdia', mdhd, hdlr, rawBox('minf', stbl));
+	const tkhd = fullRawBox('tkhd', u32be(0), u32be(1), u32be(1), u32be(0), u32be(0), new Uint8Array(8),
+		new Uint8Array(60), u32be(0), u32be(0));
+	const mvhd = fullRawBox('mvhd', u32be(0), u32be(0), u32be(timescale), u32be(0), u16be(0x100), u16be(0),
+		new Uint8Array(10), new Uint8Array(36), new Uint8Array(24), u32be(2));
+	const moov = rawBox('moov', mvhd, rawBox('trak', tkhd, mdia));
+	return concatBytes(rawBox('ftyp', asciiBytes('isom'), u32be(0), asciiBytes('isom')), moov);
+};
+
+for (const [storedRate, timescale, expectedRate] of [
+	[48000, 96000, 96000],
+	[48000, 192000, 192000],
+	[44100, 88200, 88200],
+	[48000, 48000, 48000],
+] as const) {
+	test(`demuxer reconstructs the real ${expectedRate} Hz sample rate from a capped stsd field`, async () => {
+		const file = cappedRateAudioFile(storedRate, timescale);
+		using input = new Input({ source: new BufferSource(file), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+
+		expect(await track.getSampleRate()).toBe(expectedRate);
+		expect(await track.getNumberOfChannels()).toBe(2);
+	});
+}
